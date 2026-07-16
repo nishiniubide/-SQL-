@@ -1,0 +1,813 @@
+-- =============================================
+-- Author:		任俊景
+-- Create date: <2023/6/19>
+-- Description:	<原料收货任务保存后处理过程>
+-- =============================================
+CREATE PROCEDURE [dbo].[CWXT_YLSHRW_MASTER_LAST_PROC] @FormNo NVARCHAR(20),
+                                                      @Results NVARCHAR(3) OUTPUT,
+                                                      @Msg NVARCHAR(500) OUTPUT
+AS
+BEGIN
+    DECLARE @RecordCount INT
+    DECLARE @RelationFormNo NVARCHAR(50)--到货单号
+    DECLARE @RelationItemNo INT--到货单行
+    DECLARE @WareHouseCode NVARCHAR(50)
+    DECLARE @WareHouseType INT
+    DECLARE @Company NVARCHAR(50)
+    DECLARE @SHNo NVARCHAR(50)
+    DECLARE @BatchNo NVARCHAR(50)
+    DECLARE @ActualDate DATE
+    DECLARE @ItemCount INT--明细行总数
+    DECLARE @SupplierCode NVARCHAR(50)--供应商编码
+    DECLARE @TransactionType NVARCHAR(50)--事务类型
+    DECLARE @BJNo NVARCHAR(50) --报检单号
+    DECLARE @POFormNo NVARCHAR(50) --采购订单号
+    DECLARE @POItemNo INT --采购订单行
+    DECLARE @MaterialCode NVARCHAR(50) --物料编码
+    DECLARE @HandBy NVARCHAR(50)
+    DECLARE @Department NVARCHAR(50)
+    DECLARE @ProductId NVARCHAR(50)--物料属性
+
+    DECLARE @TotalQty MONEY
+    DECLARE @ArriveQty FLOAT--到货量
+    DECLARE @PutawayQty FLOAT--收货量
+    DECLARE @IsLastTray BIT --是否最后一托
+
+    DECLARE @SupplierBatchNo NVARCHAR(500)--供应商批次
+    DECLARE @SHQty MONEY --收货数量
+    DECLARE @NeedCheck BIT--检验标识
+    DECLARE @POtype NVARCHAR(50) --到货类型
+    DECLARE @RKNo NVARCHAR(50)
+
+    -- 添加贸易类型 by 谭浩天 20260607
+    DECLARE @TradeMode NVARCHAR(50)
+    -- 添加单号前缀 by 谭浩天 20260607
+    DECLARE @Prefix NVARCHAR(50)
+
+    SET @Results = '000'
+
+    SELECT @RelationFormNo = RelationFormNo,
+           @RelationItemNo = RelationItemNo,
+           @WareHouseCode = WareHouseCode,
+           @Company = Company,
+           @ActualDate = ActualDate,
+           @SupplierCode = SupplierCode,
+           @TransactionType = TransactionType,
+           @HandBy = HandBy,
+           @Department = Department,
+           @IsLastTray = IsLastTray,
+           @TradeMode = TradeMode
+    FROM tblMaterialTaskMaster
+    WHERE FormNo = @FormNo
+
+    SELECT @BatchNo = BatchNo, @NeedCheck = NeedCheck
+    FROM tblPOArriveDetail
+    WHERE FormNo = @RelationFormNo
+      AND ItemNo = @RelationItemNo
+
+    SELECT @TotalQty = SUM(Qty),
+           @ItemCount = COUNT(1)
+    FROM tblMaterialTaskDetail
+    WHERE FormNo = @FormNo
+
+    --获取仓库类型，0：平面库，10：立体库
+    SELECT @WareHouseType = ISNULL(WareHouseType, 0)
+    FROM tblWareHouse
+    WHERE WareHouseCode = @WareHouseCode
+
+    UPDATE tblMaterialTaskMaster
+    SET TotalQty=@TotalQty,
+        WareHouseType=@WareHouseType
+    WHERE FormNo = @FormNo
+
+    --更新到货明细已收货量
+    UPDATE tblPOArriveDetail
+    SET PutawayQty=ISNULL(PutawayQty, 0) + ISNULL(@TotalQty, 0)
+    WHERE tblPOArriveDetail.FormNo = @RelationFormNo
+      AND tblPOArriveDetail.ItemNo = @RelationItemNo
+
+    --获取到货量、收货量、采购订单号、采购订单行、物料编码
+    SELECT @ArriveQty = ROUND(ISNULL(Qty, 0), 2),
+           @PutawayQty = ROUND(ISNULL(PutawayQty, 0), 2),
+           @POFormNo = POFormNo,
+           @POItemNo = POItemNo,
+           @MaterialCode = MaterialCode
+    FROM tblPOArriveDetail
+    WHERE FormNo = @RelationFormNo
+      AND ItemNo = @RelationItemNo
+
+    --获取物料属性
+    SELECT @ProductId = ProductId, @POtype = POType FROM tblPOArriveMaster WHERE FormNo = @RelationFormNo
+
+    IF @Company = 'T1' AND @WareHouseCode <> 'T1-W24' AND @POtype = 'RDPODH'
+        BEGIN
+            SET @Results = '999'
+            SET @Msg = '研发采购必须入一厂研发原料仓，请检查！！！'
+            RETURN
+        END
+
+    IF @Company = 'T2' AND @WareHouseCode <> 'T2-W24' AND @POtype = 'RDPODH'
+        BEGIN
+            SET @Results = '999'
+            SET @Msg = '研发采购必须入二厂研发原料仓，请检查！！！'
+            RETURN
+        END
+
+    IF @Company = 'T1' AND @WareHouseCode = 'T1-W24' AND @POtype = 'PODH'
+        BEGIN
+            SET @Results = '999'
+            SET @Msg = '采购申请不能入一厂研发原料仓，请检查！！！'
+            RETURN
+        END
+
+    IF @Company = 'T2' AND @WareHouseCode = 'T2-W24' AND @POtype = 'PODH'
+        BEGIN
+            SET @Results = '999'
+            SET @Msg = '采购申请不能入二厂研发原料仓，请检查！！！'
+            RETURN
+        END
+
+    IF @Company = 'U'
+        BEGIN
+            --判断收货量是否超过到货量
+            IF @PutawayQty > @ArriveQty
+                BEGIN
+                    SET @Results = '999'
+                    SET @Msg = '收货量' + CONVERT(VARCHAR(20), @PutawayQty) + ',超过到货量' +
+                               CONVERT(VARCHAR(20), @ArriveQty) + '，不得保存！'
+                    RETURN
+                END
+
+            --仓管员王丽霞 提交原料收货任务校验 IT运维申请：202505201023000504810
+            --申请在收货PDA上增加一个收货数量和到货数量不一致时报错功能  BY 周介旺 2025.07.28
+
+            IF (@PutawayQty < @ArriveQty AND ISNULL(@IsLastTray, 0) = 1)
+                BEGIN
+                    SET @Results = '999'
+                    SET @Msg = '收货量合计是' + CONVERT(VARCHAR(20), @PutawayQty) + ',不等于到货量' +
+                               CONVERT(VARCHAR(20), @ArriveQty) + '，不得保存！'
+                    RETURN
+                END
+
+            IF (@PutawayQty = @ArriveQty AND ISNULL(@IsLastTray, 0) = 0)
+                BEGIN
+                    SET @Results = '999'
+                    SET @Msg = '收货量合计是' + CONVERT(VARCHAR(20), @PutawayQty) + ',等于到货量' +
+                               CONVERT(VARCHAR(20), @ArriveQty) + '，请勾选最后一托,再来保存！'
+                    RETURN
+                END
+
+        END
+    ELSE
+        BEGIN
+            --判断收货量是否超过到货量
+            IF @PutawayQty > @ArriveQty
+                BEGIN
+                    SET @Results = '999'
+                    --set @Msg='收货量'+@PutawayQty+',超过到货量'+@ArriveQty+'，不得保存！'
+                    SET @Msg = '收货量' + CONVERT(VARCHAR(20), @PutawayQty) + ',超过到货量' +
+                               CONVERT(VARCHAR(20), @ArriveQty) + '，不得保存！'
+                    RETURN
+                END
+        END
+
+    -- BJ 类型 且 HK 采购订单 生成 HK 出库单据 by 谭浩天 20260630
+    IF @Company = 'Z' AND @TradeMode = 'BJ' AND @POFormNo LIKE 'HK%'
+        BEGIN
+            -- 1. 声明游标所需变量
+            DECLARE @Cur_ItemNo INT
+            DECLARE @Cur_RelationFormNo NVARCHAR(50)
+            DECLARE @Cur_RelationItemNo INT
+            DECLARE @Cur_BatchNo NVARCHAR(50)
+            DECLARE @Cur_BarCode NVARCHAR(50)
+            DECLARE @Cur_MaterialCode NVARCHAR(50)
+            DECLARE @Cur_MaterialName NVARCHAR(100)
+            DECLARE @Cur_MaterialModel NVARCHAR(100)
+            DECLARE @Cur_MaterialStd NVARCHAR(100)
+            DECLARE @Cur_Unit1 NVARCHAR(20)
+            DECLARE @Cur_Qty DECIMAL(18, 4)
+            DECLARE @Cur_Package DECIMAL(18, 4)
+            DECLARE @Cur_ProduceDate DATETIME
+            DECLARE @Cur_Remarks NVARCHAR(500)
+            DECLARE @Cur_MassDate NVARCHAR(50)
+            DECLARE @Cur_PackageNo NVARCHAR(50)
+            DECLARE @Cur_SupplierBatchNo NVARCHAR(50)
+
+            DECLARE @StoreQty DECIMAL(18, 4)
+            DECLARE @StorePackage DECIMAL(18, 4)
+
+            -- 2. 定义游标，获取任务单明细数据
+            DECLARE k CURSOR FOR
+                SELECT MTD.ItemNo,
+                       POD.POFormNo,
+                       POD.POItemNo,
+                       MTD.BatchNo,
+                       MTD.BarCode,
+                       MTD.MaterialCode,
+                       MTD.MaterialName,
+                       MTD.MaterialModel,
+                       MTD.MaterialStd,
+                       MTD.Unit1,
+                       MTD.Qty,
+                       MTD.Package,
+                       MTD.ProduceDate,
+                       MTD.Remarks,
+                       MTD.MassDate,
+                       MTD.PackageNo,
+                       MTD.SupplierBatchNo
+                FROM tblMaterialTaskDetail MTD
+                         INNER JOIN tblPOArriveDetail POD
+                                    ON POD.FormNo = MTD.RelationFormNo
+                                        AND POD.ItemNo = MTD.RelationItemNo
+                WHERE MTD.FormNo = @FormNo
+
+
+            OPEN k
+            FETCH NEXT FROM k INTO @Cur_ItemNo, @Cur_RelationFormNo, @Cur_RelationItemNo, @Cur_BatchNo, @Cur_BarCode,
+                @Cur_MaterialCode, @Cur_MaterialName, @Cur_MaterialModel, @Cur_MaterialStd, @Cur_Unit1,
+                @Cur_Qty, @Cur_Package, @Cur_ProduceDate, @Cur_Remarks, @Cur_MassDate, @Cur_PackageNo,
+                @Cur_SupplierBatchNo
+
+            WHILE @@FETCH_STATUS = 0
+                BEGIN
+                    -- 查询HK仓库库存
+                    SELECT @StoreQty = Qty, @StorePackage = Package
+                    FROM tblMaterialStore
+                    WHERE BarCode = @Cur_BarCode
+                      AND WareHouseCode = 'HK-W01'
+
+                    -- 校验1：条码是否在HK仓库存在
+                    IF @@ROWCOUNT = 0 OR @StoreQty IS NULL
+                        BEGIN
+                            SET @Results = '999'
+                            SET @Msg = '第' + CAST(@Cur_ItemNo AS NVARCHAR) + '行:条码 [' + ISNULL(@Cur_BarCode, '') +
+                                       '] 在HK仓库(HK-W01)中不存在!'
+                            CLOSE k
+                            DEALLOCATE k
+                            RETURN
+                        END
+
+                    -- 校验2：出库数量必须等于库存量
+                    IF ROUND(ISNULL(@StoreQty, 0), 4) <> ROUND(ISNULL(@Cur_Qty, 0), 4)
+                        BEGIN
+                            SET @Results = '999'
+                            SET @Msg = '第' + CAST(@Cur_ItemNo AS NVARCHAR) + '行:条码出库数量必须等于库存量，请检查!'
+                            CLOSE k
+                            DEALLOCATE k
+                            RETURN
+                        END
+
+                    -- 校验3：出库件数必须等于库存件数
+                    IF @StorePackage IS NOT NULL AND ISNULL(@StorePackage, 0) <> ISNULL(@Cur_Package, 0)
+                        BEGIN
+                            SET @Results = '999'
+                            SET @Msg = '第' + CAST(@Cur_ItemNo AS NVARCHAR) + '行:条码出库件数必须等于库存件数，请检查!'
+                            CLOSE k
+                            DEALLOCATE k
+                            RETURN
+                        END
+
+                    FETCH NEXT FROM k INTO @Cur_ItemNo, @Cur_RelationFormNo, @Cur_RelationItemNo, @Cur_BatchNo, @Cur_BarCode,
+                        @Cur_MaterialCode, @Cur_MaterialName, @Cur_MaterialModel, @Cur_MaterialStd, @Cur_Unit1,
+                        @Cur_Qty, @Cur_Package, @Cur_ProduceDate, @Cur_Remarks, @Cur_MassDate, @Cur_PackageNo,
+                        @Cur_SupplierBatchNo
+                END
+
+            CLOSE k
+
+            -- 1. 生成原料出库单号
+            DECLARE @HKCKFormNo NVARCHAR(50)
+            EXEC sp_NewNumber 'CWXT_YLCK', 'HKYLCK', @HKCKFormNo OUTPUT
+
+            IF @HKCKFormNo IS NOT NULL
+                BEGIN
+                    -- 2. 生成出库主表
+                    INSERT INTO tblMaterialTransaction(FormNo, Company, TransactionType, WareHouseCode,
+                                                       SupplierCode, BusType, RelationFormNo, ActualDate,
+                                                       TransactionHandBy, HandBy, Department, InputDate, Status,
+                                                       Remarks, InputTime, TaskNo, TradeMode, Prefix)
+                    SELECT @HKCKFormNo,
+                           'HK',
+                           'YLCK',
+                           'HK-W01',
+                           @SupplierCode,
+                           '送货出库',
+                           @FormNo,
+                           GETDATE(),
+                           @HandBy,
+                           HandBy,
+                           Department,
+                           InputDate,
+                           '新建',
+                           Remarks,
+                           GETDATE(),
+                           FormNo,
+                           'NX',
+                           'HKYLCK'
+                    FROM tblMaterialTaskMaster
+                    WHERE FormNo = @FormNo
+
+                    -- 3. 打开游标写入
+                    OPEN k
+                    FETCH NEXT FROM k INTO @Cur_ItemNo, @Cur_RelationFormNo, @Cur_RelationItemNo, @Cur_BatchNo, @Cur_BarCode,
+                        @Cur_MaterialCode, @Cur_MaterialName, @Cur_MaterialModel, @Cur_MaterialStd, @Cur_Unit1,
+                        @Cur_Qty, @Cur_Package, @Cur_ProduceDate, @Cur_Remarks, @Cur_MassDate, @Cur_PackageNo,
+                        @Cur_SupplierBatchNo
+
+                    WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                            -- 3.1 插入明细数据
+                            INSERT INTO tblMaterialTransactionDetail(FormNo, ItemNo, RelationFormNo, RelationItemNo,
+                                                                     LotNo, BarCode, MaterialCode, MaterialName,
+                                                                     MaterialModel, MaterialStd, Unit1, Qty, Package,
+                                                                     ProduceDate, WareHouseCode, WareHouseAreaCode,
+                                                                     IsBarCode, Remarks, MassDate, PackageNo,
+                                                                     SupplierBatchNo)
+                            VALUES (@HKCKFormNo,
+                                    @Cur_ItemNo,
+                                    @Cur_RelationFormNo,
+                                    @Cur_RelationItemNo,
+                                    @Cur_BatchNo,
+                                    @Cur_BarCode,
+                                    @Cur_MaterialCode,
+                                    @Cur_MaterialName,
+                                    @Cur_MaterialModel,
+                                    @Cur_MaterialStd,
+                                    @Cur_Unit1,
+                                    @Cur_Qty,
+                                    @Cur_Package,
+                                    @Cur_ProduceDate,
+                                    'HK-W01',
+                                    '',
+                                    1,
+                                    @Cur_Remarks,
+                                    @Cur_MassDate,
+                                    @Cur_PackageNo,
+                                    @Cur_SupplierBatchNo)
+
+                            -- 3.2 更新库存表
+                            UPDATE tblMaterialStore
+                            SET Qty     = ISNULL(Qty, 0) - ISNULL(@Cur_Qty, 0),
+                                Package = Package - ISNULL(@Cur_Package, 0)
+                            WHERE BarCode = @Cur_BarCode
+                              AND WareHouseCode = 'HK-W01'
+
+                            -- 3.3 更新条码信息表
+                            UPDATE tblMaterialDetail
+                            SET OutStore     = 1,
+                                OutStoreDate = GETDATE()
+                            WHERE BarCode = @Cur_BarCode
+
+                            FETCH NEXT FROM k INTO @Cur_ItemNo, @Cur_RelationFormNo, @Cur_RelationItemNo, @Cur_BatchNo, @Cur_BarCode,
+                                @Cur_MaterialCode, @Cur_MaterialName, @Cur_MaterialModel, @Cur_MaterialStd, @Cur_Unit1,
+                                @Cur_Qty, @Cur_Package, @Cur_ProduceDate, @Cur_Remarks, @Cur_MassDate, @Cur_PackageNo,
+                                @Cur_SupplierBatchNo
+                        END
+
+                    -- 关闭并释放游标
+                    CLOSE k
+                    DEALLOCATE k
+                END
+            ELSE
+                BEGIN
+                    SET @Results = '999'
+                    SET @Msg = '未获取到原料出库单号！'
+                    RETURN
+                END
+        END
+
+    DECLARE @MaterialClassCode INT
+    SELECT @MaterialClassCode = COUNT(B.MaterialClassCode)
+    FROM tblMaterialTaskDetail A
+             INNER JOIN tblMaterial B ON A.MaterialCode = B.MaterialCode
+             INNER JOIN tblMaterialClass C ON B.MaterialClassCode = C.MaterialClassCode
+             INNER JOIN tblPOArriveMaster D ON A.RelationFormNo = D.FormNo
+    WHERE A.FormNo = @FormNo
+      AND C.ProductId = 'YL'
+      AND D.POType = 'PODH'
+      AND C.ParentID IN ('CA', 'CB', 'CRGY')
+
+    --原料收货来料检验,采购到货只检验CA、CB、CRGY，研发采购到货根据物料检验属性CR来判断，CA、CB必检，来生成报检单 BY 黄明 2023.11.17
+    --三厂必须全部生成报检单 BY 黄明 2023.12.15
+    IF (@POtype = 'PODH' AND @MaterialClassCode > 0) OR (@Company = 'U' AND @POtype = 'PODH')
+        BEGIN
+            IF @ArriveQty = @PutawayQty
+                BEGIN
+                    DECLARE bj CURSOR FOR SELECT SupplierBatchNo, SUM(Qty) AS Qty
+                                          FROM tblMaterialTaskDetail
+                                          WHERE RelationFormNo = @RelationFormNo
+                                            AND RelationItemNo = @RelationItemNo
+                                            AND FormNo LIKE '%YLSHRW%'
+                                          GROUP BY SupplierBatchNo
+                    OPEN bj
+                    FETCH NEXT FROM bj INTO @SupplierBatchNo,@SHQty
+                    WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                            -- 产生报检单
+                            -- 对保税情况进行特殊处理 by 谭浩天 20260507
+                            IF @TradeMode = 'BJ'
+                                BEGIN
+                                    SET @Prefix = @Company + @TradeMode + 'LLBJ'
+                                END
+                            ELSE
+                                BEGIN
+                                    SET @Prefix = @Company + 'LLBJ'
+                                END
+
+                            EXEC [sp_NewNumber] 'ZLGL_LLBJ', @Prefix, @BJNo OUTPUT
+                            IF @BJNo IS NOT NULL
+                                BEGIN
+
+                                    INSERT INTO tblMaterialSubmitCheckList(FormNo, Company, SupplierCode,
+                                                                           POArriveFormNo, POArriveItemNo, BatchNo,
+                                                                           POFormNo, POItemNo, MaterialCode,
+                                                                           Qty, SubmitBy, SubmitDate, SupplierBatchNo,
+                                                                           ProductId, HandBy, Department, InputDate,
+                                                                           Status)
+                                    VALUES (@BJNo, @Company, @SupplierCode, @RelationFormNo, @RelationItemNo, @BatchNo,
+                                            @POFormNo, @POItemNo, @MaterialCode,
+                                            @SHQty, @HandBy, GETDATE(), @SupplierBatchNo, @ProductId, @HandBy,
+                                            @Department, GETDATE(), '新建')
+
+                                END
+
+                            FETCH NEXT FROM bj INTO @SupplierBatchNo,@SHQty
+                        END
+                    CLOSE bj
+                    DEALLOCATE bj
+                END
+        END
+
+    --不含CA.CB,CRGY料的根据物料是否检验生成报检单 BY 黄明 2023.12.15
+    IF @POtype = 'PODH' AND @MaterialClassCode = 0 AND @Company IN ('T1', 'T2')
+        BEGIN
+            IF @ArriveQty = @PutawayQty --and @NeedCheck=1 注释，防止走采购到货的研发料不生成报检单  by 吴轶超 2024-4-24
+                BEGIN
+                    DECLARE bj CURSOR FOR SELECT SupplierBatchNo, SUM(Qty) AS Qty
+                                          FROM tblMaterialTaskDetail
+                                          WHERE RelationFormNo = @RelationFormNo
+                                            AND RelationItemNo = @RelationItemNo
+                                            AND FormNo LIKE '%YLSHRW%'--二厂合托功能导致重复计算了报检汇总量 增加判断条件 by 吴轶超 20260106
+                                          GROUP BY SupplierBatchNo
+                    OPEN bj
+                    FETCH NEXT FROM bj INTO @SupplierBatchNo,@SHQty
+                    WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                            -- 产生报检单
+                            -- 对保税情况进行特殊处理 by 谭浩天 20260507
+                            IF @TradeMode = 'BJ'
+                                BEGIN
+                                    SET @Prefix = @Company + @TradeMode + 'LLBJ'
+                                END
+                            ELSE
+                                BEGIN
+                                    SET @Prefix = @Company + 'LLBJ'
+                                END
+
+                            EXEC [sp_NewNumber] 'ZLGL_LLBJ', @Prefix, @BJNo OUTPUT
+                            IF @BJNo IS NOT NULL
+                                BEGIN
+                                    INSERT INTO tblMaterialSubmitCheckList(FormNo, Company, SupplierCode,
+                                                                           POArriveFormNo, POArriveItemNo, BatchNo,
+                                                                           POFormNo, POItemNo, MaterialCode,
+                                                                           Qty, SubmitBy, SubmitDate, SupplierBatchNo,
+                                                                           ProductId, HandBy, Department, InputDate,
+                                                                           Status)
+                                    VALUES (@BJNo, @Company, @SupplierCode, @RelationFormNo, @RelationItemNo, @BatchNo,
+                                            @POFormNo, @POItemNo, @MaterialCode,
+                                            @SHQty, @HandBy, GETDATE(), @SupplierBatchNo, @ProductId, @HandBy,
+                                            @Department, GETDATE(), '新建')
+
+                                END
+
+                            FETCH NEXT FROM bj INTO @SupplierBatchNo,@SHQty
+                        END
+                    CLOSE bj
+                    DEALLOCATE bj
+                END
+        END
+
+    DECLARE @MaterialClassCode1 INT
+    SELECT @MaterialClassCode1 = COUNT(B.MaterialClassCode)
+    FROM tblMaterialTaskDetail A
+             INNER JOIN tblMaterial B ON A.MaterialCode = B.MaterialCode
+             INNER JOIN tblMaterialClass C ON B.MaterialClassCode = C.MaterialClassCode
+             INNER JOIN tblPOArriveMaster D ON A.RelationFormNo = D.FormNo
+    WHERE A.FormNo = @FormNo
+      AND C.ProductId = 'YL'
+      AND D.POType = 'RDPODH'
+      AND C.ParentID IN ('CA', 'CB')
+
+    IF @POtype = 'RDPODH' AND @MaterialClassCode1 > 0
+        BEGIN
+            IF @ArriveQty = @PutawayQty
+                BEGIN
+                    DECLARE bj CURSOR FOR SELECT SupplierBatchNo, SUM(Qty) AS Qty
+                                          FROM tblMaterialTaskDetail
+                                          WHERE RelationFormNo = @RelationFormNo
+                                            AND RelationItemNo = @RelationItemNo
+                                            AND FormNo LIKE '%YLSHRW%'
+                                          GROUP BY SupplierBatchNo
+                    OPEN bj
+                    FETCH NEXT FROM bj INTO @SupplierBatchNo,@SHQty
+                    WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                            -- 产生报检单
+                            -- 对保税情况进行特殊处理 by 谭浩天 20260507
+                            IF @TradeMode = 'BJ'
+                                BEGIN
+                                    SET @Prefix = @Company + @TradeMode + 'LLBJ'
+                                END
+                            ELSE
+                                BEGIN
+                                    SET @Prefix = @Company + 'LLBJ'
+                                END
+
+                            EXEC [sp_NewNumber] 'ZLGL_LLBJ', @Prefix, @BJNo OUTPUT
+                            IF @BJNo IS NOT NULL
+                                BEGIN
+                                    INSERT INTO tblMaterialSubmitCheckList(FormNo, Company, SupplierCode,
+                                                                           POArriveFormNo, POArriveItemNo, BatchNo,
+                                                                           POFormNo, POItemNo, MaterialCode,
+                                                                           Qty, SubmitBy, SubmitDate, SupplierBatchNo,
+                                                                           ProductId, HandBy, Department, InputDate,
+                                                                           Status)
+                                    VALUES (@BJNo, @Company, @SupplierCode, @RelationFormNo, @RelationItemNo, @BatchNo,
+                                            @POFormNo, @POItemNo, @MaterialCode,
+                                            @SHQty, @HandBy, GETDATE(), @SupplierBatchNo, @ProductId, @HandBy,
+                                            @Department, GETDATE(), '新建')
+
+                                END
+
+                            FETCH NEXT FROM bj INTO @SupplierBatchNo,@SHQty
+                        END
+                    CLOSE bj
+                    DEALLOCATE bj
+                END
+        END
+
+    IF @POtype = 'RDPODH' AND @MaterialClassCode1 = 0
+        BEGIN
+            IF @ArriveQty = @PutawayQty AND @NeedCheck = 1
+                BEGIN
+                    DECLARE bj CURSOR FOR SELECT SupplierBatchNo, SUM(Qty) AS Qty
+                                          FROM tblMaterialTaskDetail
+                                          WHERE RelationFormNo = @RelationFormNo
+                                            AND RelationItemNo = @RelationItemNo
+                                            AND FormNo LIKE '%YLSHRW%'
+                                          GROUP BY SupplierBatchNo
+                    OPEN bj
+                    FETCH NEXT FROM bj INTO @SupplierBatchNo,@SHQty
+                    WHILE @@FETCH_STATUS = 0
+                        BEGIN
+                            -- 产生报检单
+                            -- 对保税情况进行特殊处理 by 谭浩天 20260507
+                            IF @TradeMode = 'BJ'
+                                BEGIN
+                                    SET @Prefix = @Company + @TradeMode + 'LLBJ'
+                                END
+                            ELSE
+                                BEGIN
+                                    SET @Prefix = @Company + 'LLBJ'
+                                END
+
+                            EXEC [sp_NewNumber] 'ZLGL_LLBJ', @Prefix, @BJNo OUTPUT
+                            IF @BJNo IS NOT NULL
+                                BEGIN
+                                    INSERT INTO tblMaterialSubmitCheckList(FormNo, Company, SupplierCode,
+                                                                           POArriveFormNo, POArriveItemNo, BatchNo,
+                                                                           POFormNo, POItemNo, MaterialCode,
+                                                                           Qty, SubmitBy, SubmitDate, SupplierBatchNo,
+                                                                           ProductId, HandBy, Department, InputDate,
+                                                                           Status)
+                                    VALUES (@BJNo, @Company, @SupplierCode, @RelationFormNo, @RelationItemNo, @BatchNo,
+                                            @POFormNo, @POItemNo, @MaterialCode,
+                                            @SHQty, @HandBy, GETDATE(), @SupplierBatchNo, @ProductId, @HandBy,
+                                            @Department, GETDATE(), '新建')
+
+                                END
+
+                            FETCH NEXT FROM bj INTO @SupplierBatchNo,@SHQty
+                        END
+                    CLOSE bj
+                    DEALLOCATE bj
+                END
+        END
+
+    --完善物料信息
+    UPDATE tblMaterialTaskDetail
+    SET MaterialName=tblMaterial.MaterialName,
+        MaterialModel=tblMaterial.MaterialModel,
+        MaterialStd=tblMaterial.MaterialStd,
+        Unit1=tblMaterial.Unit1
+    FROM tblMaterial
+    WHERE tblMaterialTaskDetail.MaterialCode = tblMaterial.MaterialCode
+      AND tblMaterialTaskDetail.FormNo = @FormNo
+
+    --当条码类型为TP，则更新到货条码表已收货标识
+    UPDATE tblPOArriveBarCode
+    SET IsPutaway=1
+    FROM tblMaterialTaskDetail
+    WHERE tblMaterialTaskDetail.FormNo = @FormNo
+      AND tblMaterialTaskDetail.BarCodeType = 'TP'
+      AND tblPOArriveBarCode.BarCode = tblMaterialTaskDetail.BarCode
+
+    --当会计单位为U，入口位置为U-QY01（一楼收货区）
+    IF @Company = 'U'
+        BEGIN
+            UPDATE tblMaterialTaskMaster SET PointCode='U-QY01' WHERE FormNo = @FormNo
+            UPDATE tblMaterialTaskDetail SET PointCode='U-QY01' WHERE FormNo = @FormNo
+        END
+
+
+    --插入条码信息表
+    INSERT INTO tblMaterialDetail(WareHouseCode, MaterialCode, LotNo, BarCode, Qty, Num, Package, WareHouseAreaCode,
+                                  ProduceDate, MassDate, SupplierBatchNo, PackageNo, Remarks, InStore, InStoreDate,
+                                  InResource)
+    SELECT
+        --WareHouseCode    2023-12-13  支行    修复收货任务选择主表的仓库后，导入明细表将主表仓库带过去，但是再重选选择主表的仓库选项保存，子表仓库没有随之更改。
+        @WareHouseCode,
+        MaterialCode,
+        BatchNo,
+        BarCode,
+        Qty,
+        Num,
+        Package,
+        WareHouseAreaCode,
+        ProduceDate,
+        MassDate,
+        SupplierBatchNo,
+        PackageNo,
+        Remarks,
+        1,
+        GETDATE(),
+        '原料收货'
+    FROM tblMaterialTaskDetail
+    WHERE FormNo = @FormNo
+
+
+    --反写到货单主表供应商批次
+    SET @SupplierBatchNo = STUFF(
+            (SELECT DISTINCT ';' + SupplierBatchNo FROM tblMaterialTaskDetail WHERE FormNo = @FormNo FOR XML PATH('')),
+            1, 1, '')
+    UPDATE tblPOArriveMaster
+    SET SupplierBatchNo=CASE
+                            WHEN ISNULL(SupplierBatchNo, '') = '' THEN @SupplierBatchNo
+                            WHEN CHARINDEX(@SupplierBatchNo, ISNULL(SupplierBatchNo, '')) = 0 THEN
+                                --因为有多个到货供应商批次号，需进行唯一性 BY 黄明 2024.03.20
+                                --SupplierBatchNo+';'+@SupplierBatchNo
+                                @SupplierBatchNo
+                            ELSE SupplierBatchNo END
+    WHERE FormNo = @RelationFormNo
+
+
+    --当仓库类型为0（平面库）,则生成收货单
+    IF @WareHouseType = 0
+        BEGIN
+            --生成收货单
+            EXEC CWXT_YLSWD_MASTER_DISPOSE_PROC @FormNo, 0, @Results OUTPUT, @Msg OUTPUT
+            IF @Results <> '000'
+                BEGIN
+                    RETURN
+                END
+        END
+
+    --当仓库类型为10（立体库）,生成托盘号，更新任务类型
+    IF @WareHouseType = 10
+        BEGIN
+            IF @Company = 'T2'
+                BEGIN
+                    --更新任务类型
+                    UPDATE tblMaterialTaskMaster SET TaskType=1 WHERE FormNo = @FormNo
+                    --生成托盘号
+                    --当明细行总数大于1，则认为是合托
+                    IF @ItemCount > 1
+                        BEGIN
+
+                            --新增合托卡控，不允许多物料合托 2024/4/26
+                            SELECT @Recordcount = COUNT(DISTINCT MaterialCode)
+                            FROM tblMaterialTaskDetail
+                            WHERE FormNo = @FormNo
+                            IF (@Recordcount > 1)
+                                BEGIN
+                                    SET @Results = '999'
+                                    SET @Msg = '不允许多种物料编码的物料合托！'
+                                    RETURN
+                                END
+
+                            UPDATE tblMaterialTaskDetail SET PackageNo='YLZT' + @FormNo WHERE FormNo = @FormNo
+                        END
+                    ELSE
+                        BEGIN
+                            --托号=条码
+                            UPDATE tblMaterialTaskDetail SET PackageNo=BarCode WHERE FormNo = @FormNo
+                        END
+                END
+
+            IF @Company = 'U'
+                BEGIN
+                    --更新任务类型
+                    UPDATE tblMaterialTaskMaster SET TaskType=1 WHERE FormNo = @FormNo
+                END
+
+        END
+
+    IF @POType = 'RDPODH'
+        BEGIN
+            IF @ArriveQty = @PutawayQty AND @NeedCheck = 0
+                BEGIN
+                    SELECT @BatchNo = BatchNo, @SupplierCode = SupplierCode, @HandBy = HandBy, @Department = Department
+                    FROM tblPOArriveMaster
+                    WHERE FormNo = @RelationFormNo
+
+                    DECLARE crk CURSOR FOR SELECT DISTINCT WareHouseCode
+                                           FROM tblMaterialStore a
+                                           WHERE a.LotNo = @BatchNo
+                    OPEN crk
+                    FETCH NEXT FROM crk INTO @WareHouseCode
+                    WHILE @@FETCH_STATUS = 0
+                        BEGIN
+
+                            EXEC sp_GetBillNO 'CWXT_RDYLRK', @Company, @RKNo OUTPUT
+                            IF @RKNo IS NOT NULL
+                                BEGIN
+                                    --生成主表
+                                    INSERT INTO tblMaterialTransaction(FormNo, Company, TransactionType, WareHouseCode,
+                                                                       SupplierCode, BusType, RelationFormNo,
+                                                                       ActualDate, TransactionHandBy, HandBy,
+                                                                       Department, InputDate, Status, ActionName,
+                                                                       Remarks)
+                                    VALUES (@RKNo, @Company, 'RDYLRK', @WareHouseCode, @SupplierCode, '采购入库',
+                                            @BatchNo, GETDATE(), @HandBy, @HandBy, @Department, GETDATE(), '新建',
+                                            'CWXT_RDYLRK', '自动入库')
+
+                                    --生成子表
+                                    INSERT INTO tblMaterialTransactionDetail(FormNo, ItemNo, RelationFormNo,
+                                                                             RelationItemNo, LotNo, BarCode,
+                                                                             MaterialClassCode, MaterialCode,
+                                                                             MaterialName, MaterialModel, MaterialStd,
+                                                                             Unit1, Qty, Package, ProduceDate,
+                                                                             WareHouseCode, WareHouseAreaCode,
+                                                                             IsBarCode, MassDate, PackageNo,
+                                                                             SupplierBatchNo)
+                                    SELECT @RKNo,
+                                           ROW_NUMBER() OVER (ORDER BY a.条码) AS ItemNo,
+                                           a.到货批次号,
+                                           a.到货批次行,
+                                           a.到货批次号,
+                                           a.条码,
+                                           a.物料分类,
+                                           a.物料编码,
+                                           a.物料名称,
+                                           a.型号,
+                                           a.规格,
+                                           a.单位,
+                                           a.数量,
+                                           a.件数,
+                                           a.生产日期,
+                                           a.仓库编码,
+                                           a.仓位,
+                                           a.条码管理,
+                                           a.到期日,
+                                           a.托号,
+                                           A.供应商批次
+                                    FROM CWXT_RDYLRK_DHQD_SEARCH_LTK a
+                                    WHERE a.仓库编码 = @WareHouseCode
+                                      AND a.到货批次号 = @BatchNo
+                                      AND a.到货批次行 = @RelationItemNo
+
+                                    EXEC CWXT_RDCKSW_MASTER_LAST_PROC @RKNo, @Results OUTPUT, @Msg OUTPUT
+                                    IF @Results <> '000'
+                                        BEGIN
+                                            CLOSE crk
+                                            DEALLOCATE crk
+                                            RETURN
+
+                                        END
+                                END
+                            ELSE
+                                BEGIN
+                                    SET @Results = '999'
+                                    SET @Msg = '未获取到入库单号！'
+                                    CLOSE crk
+                                    DEALLOCATE crk
+                                    RETURN
+                                END
+
+
+                            FETCH NEXT FROM crk INTO @WareHouseCode
+                        END
+                    CLOSE crk
+                    DEALLOCATE crk
+
+
+                END
+        END
+
+
+    UPDATE tblMaterialTaskMaster SET [Status]='新建' WHERE FormNo = @FormNo AND [Status] IS NULL
+
+
+END
+GO
+
